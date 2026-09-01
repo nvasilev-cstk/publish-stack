@@ -1,15 +1,8 @@
 {
-  "name": "publish-everything",
-  "version": "1.0.0",
-  "description": "Bulk-publish every content type entry and asset in a Contentstack stack via the Content Management API.",
-  "main": "publish-all.js",
+  "name": "publish-everything-dashboard-app",
+  "private": true,
+  "description": "Dashboard Location app (Launch Edge Function + static widget) — see README.md",
   "scripts": {
-    "start": "node publish-all.js",
-    "dry-run": "node publish-all.js --dry-run"
-  },
-  "license": "UNLICENSED",
-  "dependencies": {
-    "@contentstack/management": "^1.0.0",
-    "dotenv": "^16.4.5"
+    "build": "true"
   }
 }

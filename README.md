@@ -1,52 +1,100 @@
-# publish-everything
+# publish-everything — Dashboard App
 
-Bulk-publishes every entry (across every content type) and every asset in a
-Contentstack stack, to a single environment, in every locale the stack has
-configured. Talks to the Content Management API directly via the official
-`@contentstack/management` Node SDK — no dependency on the Contentstack CLI
-being installed or logged in, so it also runs in CI or any isolated
-environment.
+A Contentstack Dashboard Location app: a "Publish All" button and live
+progress log embedded in the stack dashboard, backed by a Launch Edge
+Function. This is the repo root because Launch deploys from whatever's at
+the git repo root — it doesn't offer a way to pick a subdirectory as the
+deploy target (moving this here, out of a `dashboard-app/` subfolder, is
+what fixed that).
 
-## Setup
+The standalone Node CLI version of this (same idea, run from a terminal or
+CI instead of embedded in the CMS) lives in [`cli/`](cli/README.md).
 
-```bash
-npm install
-cp .env.example .env
+## Why this isn't just the Node script running as-is
+
+Contentstack Launch's two function types each rule out the obvious designs:
+
+- **Cloud Functions** are real Node.js, but capped at a **30-second**
+  execution timeout — nowhere near enough for a full-stack publish run.
+- **Edge Functions** have **no duration limit** as long as the client holds
+  the connection open, but run a WinterCG runtime with **no Node.js APIs**
+  — `@contentstack/management`'s axios transport won't work there.
+
+So this app runs the whole job inside one Edge Function
+(`functions/publish-stream.edge.js`), talking to the CMA via plain `fetch()`
+instead of the SDK, and streams progress back over that single connection as
+newline-delimited JSON while it runs — no job store, no polling, nothing to
+go stale between requests. The trade-off: if the dashboard tab closes
+mid-run, the stream ends (already-published items are harmless no-ops if you
+just re-run it).
+
+The request/response shapes used in `functions/lib/cma.js` and
+`functions/lib/pipeline.js` (publish body = `{ "entry": { locales,
+environments }, "locale": "..." }`, list responses keyed as
+`content_types`/`entries`/`assets`/`locales`) were confirmed directly against
+`@contentstack/management`'s bundled source, not just docs — see
+`cli/node_modules/@contentstack/management/dist/node/contentstack-management.js`
+(after `cd cli && npm install`) if you ever need to re-verify after an SDK
+upgrade.
+
+## Structure
+
+```
+package.json          # no dependencies — just a no-op "build" script so
+                       # Launch's build step doesn't fail if it insists on
+                       # running one
+functions/
+  publish-stream.edge.js   # the one HTTP endpoint, GET /publish-stream
+  lib/
+    config.js              # reads Launch env vars
+    rateLimiter.js         # same throttle/retry logic as the CLI version
+    cma.js                 # raw-fetch CMA client
+    pipeline.js            # the actual publish logic, as an async generator
+public/
+  index.html               # the widget UI (button, progress bars, log)
+cli/                        # standalone Node CLI (see cli/README.md)
 ```
 
-Fill in `.env`:
+## Auth model
 
-- `CS_STACK_API_KEY` / `CS_MANAGEMENT_TOKEN` — from Settings > Tokens in the stack.
-- `CS_ENVIRONMENT` — defaults to `production`. Kept as a setting, not hardcoded.
-- `CS_REGION` — `NA | EU | AU | AZURE_NA | AZURE_EU | GCP_NA | GCP_EU`. Set `CS_HOST` instead if your region isn't in that list.
-- `CS_RATE_LIMIT_RPS` — defaults to 8, a safety margin under the CMA's 10 req/s org-wide limit.
+Same as the CLI: a stack Management Token, stored as a Launch environment
+variable, never sent to the browser. This means the app is wired to **one
+specific stack** — it's an internal tool, not a multi-tenant marketplace
+app. As a safety net, the widget passes the current stack's `api_key` (read
+from the App SDK) on every request, and the edge function refuses to run if
+it doesn't match the configured token's stack.
 
-## Usage
+## Deploying
 
-```bash
-node publish-all.js --dry-run   # lists what would be published, makes no changes
-node publish-all.js             # asks for confirmation, then publishes
-node publish-all.js --yes       # skips the confirmation prompt (for CI)
-```
+1. **Launch project**: create a new Launch project pointing at this repo.
+   - Framework Preset: **Other**
+   - Build Command: leave blank (there's a no-op `build` script in
+     `package.json` as a fallback in case Launch runs one regardless)
+   - Output Directory: `./public`
+   - Environment variables (Launch → your environment → Settings):
+     `CS_STACK_API_KEY`, `CS_MANAGEMENT_TOKEN`, `CS_ENVIRONMENT`
+     (default `production`), `CS_REGION` (e.g. `EU`), `CS_RATE_LIMIT_RPS`
+     (default `8`), and optionally `CS_MASTER_LOCALE` — same meanings as in
+     `cli/.env.example`. A new deployment is required after adding/changing
+     env vars.
 
-## How it works
+2. **Developer Hub app**: create an app in Developer Hub, add a **Dashboard**
+   UI Location, and set its hosting to this Launch project's URL (Hosting
+   tab → Custom Hosting, or select the Launch project directly if your org's
+   Developer Hub offers that integration). Install the app on the target
+   stack.
 
-1. Fetches the stack's master locale and full locale list.
-2. Fetches all content type UIDs (paginated).
-3. For each content type, fetches all entry UIDs (paginated, master locale).
-4. Fetches all asset UIDs (paginated).
-5. Publishes each entry/asset to `CS_ENVIRONMENT`, across all locales in a
-   single publish call per item (CMA supports up to 50 locales per call —
-   the script chunks automatically if a stack has more than that).
+3. Open the stack dashboard, find the widget, tick/untick **Dry run**, and
+   click **Publish All**. Dry run lists counts without publishing anything —
+   run it first to sanity-check before a real run.
 
-Every CMA call — reads and publishes alike — goes through a shared rate
-limiter (`src/rateLimiter.js`) that spaces out request *initiation* to stay
-under the RPS limit, and retries with backoff (honoring `Retry-After`) if a
-429 slips through anyway.
+## Verifying before a real run
 
-## Porting to a Dashboard App
+This hasn't been run against a live stack yet. Before trusting it for a full
+production publish:
 
-The publish logic (`src/*.js`) has no CLI or process-level dependencies —
-it's plain functions taking a `stack` client and a rate limiter. To turn
-this into a Dashboard App later, swap `src/client.js`'s management-token
-auth for the App SDK's OAuth-based client and reuse everything else as-is.
+1. Run a **dry run** first and confirm the entry/asset/locale counts look
+   right.
+2. Do one real run against a **non-production** environment first (temporarily
+   set `CS_ENVIRONMENT` to a staging environment) to confirm publish calls
+   actually succeed end-to-end, before pointing it at `production`.
