@@ -27,13 +27,15 @@ export default async function handler(request, response) {
     return;
   }
 
-  const stack = makeStack(config);
-  const limiter = new RateLimiter(config.rateLimitRps);
-
+  // Everything below (including client construction) is inside the guard —
+  // an uncaught synchronous throw here would otherwise surface to the
+  // browser as an opaque 502 instead of a readable JSON error.
   try {
+    const stack = await makeStack(config);
+    const limiter = new RateLimiter(config.rateLimitRps);
     const result = await runStep(stack, limiter, config, state, dryRun);
     response.status(200).json(result);
   } catch (err) {
-    response.status(500).json({ error: err.message || String(err) });
+    response.status(500).json({ error: err.message || String(err), stack: err.stack });
   }
 }
