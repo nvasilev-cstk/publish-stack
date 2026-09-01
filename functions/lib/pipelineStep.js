@@ -1,4 +1,5 @@
 import { withRetry } from './rateLimiter.js';
+import { describeError } from './errors.js';
 
 const MAX_LOCALES_PER_CALL = 50;
 const STEP_TIME_BUDGET_MS = 20000; // leaves a margin under Cloud Functions' 30s cap
@@ -20,7 +21,7 @@ function findMasterLocale(localeItems, override) {
   );
 }
 
-function initialState(dryRun) {
+export function initialState(dryRun) {
   return {
     phase: 'locales',
     dryRun: Boolean(dryRun),
@@ -47,8 +48,23 @@ function initialState(dryRun) {
 // Performs exactly one bounded unit of work (one page fetch, or one item
 // publish) and mutates `state` to reflect it, pushing any human-readable
 // progress lines onto `log`. Returns false only if there's truly nothing
-// left to do (shouldn't happen while phase !== 'done').
+// left to do (shouldn't happen while phase !== 'done'). Discovery-phase
+// failures (locales/content-types/entries/assets) propagate out — enriched
+// with which phase (and, for entries, which content type) was in progress —
+// since those aren't per-item recoverable the way publish failures are.
 async function runUnit(stack, limiter, config, state, log) {
+  try {
+    return await runUnitInner(stack, limiter, config, state, log);
+  } catch (err) {
+    err.phase = err.phase || state.phase;
+    if (state.phase === 'entries' && !err.context) {
+      err.context = { contentTypeUid: state.contentTypeUids[state.entryCtIndex] };
+    }
+    throw err;
+  }
+}
+
+async function runUnitInner(stack, limiter, config, state, log) {
   switch (state.phase) {
     case 'locales': {
       const result = await limiter.schedule(() =>
@@ -187,11 +203,15 @@ function computeProgress(state) {
   };
 }
 
-// Runs bounded units of work until the time budget runs out or the whole
-// job reaches 'done', returning the (mutated) state for the caller to send
-// back on the next call.
-export async function runStep(stack, limiter, config, incomingState, dryRun, timeBudgetMs = STEP_TIME_BUDGET_MS) {
-  const state = incomingState && incomingState.phase ? incomingState : initialState(dryRun);
+// Runs bounded units of work until the time budget runs out, the whole job
+// reaches 'done', or a discovery-phase call fails outright. `state` must
+// already be a real state object (see initialState) — the caller owns
+// constructing it so it can report `state.phase` even on a first-call
+// failure. Returns normally (HTTP 200) even on failure, with an `error`
+// field, rather than throwing — that way the widget gets a clean,
+// informative response instead of a bare 500 for anything short of a truly
+// unexpected crash (which publish-step.js's own try/catch still guards).
+export async function runStep(stack, limiter, config, state, dryRun, timeBudgetMs = STEP_TIME_BUDGET_MS) {
   const deadline = Date.now() + timeBudgetMs;
   const log = [];
 
@@ -199,10 +219,20 @@ export async function runStep(stack, limiter, config, incomingState, dryRun, tim
     log.push(`Target environment: ${config.environment}`, 'Fetching locales...');
   }
 
-  while (state.phase !== 'done' && Date.now() < deadline) {
-    // eslint-disable-next-line no-await-in-loop
-    const advanced = await runUnit(stack, limiter, config, state, log);
-    if (!advanced) break;
+  try {
+    while (state.phase !== 'done' && Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop
+      const advanced = await runUnit(stack, limiter, config, state, log);
+      if (!advanced) break;
+    }
+  } catch (err) {
+    return {
+      state,
+      log,
+      progress: computeProgress(state),
+      done: false,
+      error: describeError(err, state.phase),
+    };
   }
 
   const done = state.phase === 'done';

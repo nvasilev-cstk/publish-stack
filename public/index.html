@@ -108,6 +108,23 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  // Shows every field the server sent (message, phase, status, errorCode,
+  // errorMessage, context, stack, ...) instead of just a bare message, and
+  // always dumps the raw object to the console too — see the response
+  // there for anything this doesn't render (e.g. a nested `errors` object).
+  function logErrorDetails(label, details) {
+    details = details || {};
+    log(label + (details.message ? ': ' + details.message : ''), 'error');
+    if (details.errorMessage && details.errorMessage !== details.message) log('  errorMessage: ' + details.errorMessage, 'error');
+    if (details.errorCode !== undefined) log('  errorCode: ' + details.errorCode, 'error');
+    if (details.status !== undefined) log('  status: ' + details.status, 'error');
+    if (details.phase) log('  phase: ' + details.phase, 'error');
+    if (details.context) log('  context: ' + JSON.stringify(details.context), 'error');
+    if (details.errors) log('  errors: ' + JSON.stringify(details.errors), 'error');
+    log('  (full details logged to the browser console)', 'error');
+    console.error(label, details);
+  }
+
   function setProgress(kind, done, total, failed) {
     var countEl = kind === 'entries' ? entriesCount : assetsCount;
     var barEl = kind === 'entries' ? entriesBar : assetsBar;
@@ -144,9 +161,10 @@
       }
 
       var data = await response.json().catch(function () { return {}; });
+      console.log('publish-step response', response.status, data);
 
       if (!response.ok) {
-        log(data.error || ('Request failed with status ' + response.status), 'error');
+        logErrorDetails('Request failed with status ' + response.status, data);
         break;
       }
 
@@ -155,6 +173,11 @@
         phaseLine.textContent = PHASE_LABELS[data.progress.phase] || data.progress.phase;
         setProgress('entries', data.progress.entries.done, data.progress.entries.total, data.progress.entries.failed);
         setProgress('assets', data.progress.assets.done, data.progress.assets.total, data.progress.assets.failed);
+      }
+
+      if (data.error) {
+        logErrorDetails('Pipeline error', data.error);
+        break;
       }
 
       if (data.done) {
