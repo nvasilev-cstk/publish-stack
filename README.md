@@ -1,57 +1,63 @@
 # publish-everything — Dashboard App
 
 A Contentstack Dashboard Location app: a "Publish All" button and live
-progress log embedded in the stack dashboard, backed by a Launch Edge
+progress log embedded in the stack dashboard, backed by a Launch Cloud
 Function. This is the repo root because Launch deploys from whatever's at
 the git repo root — it doesn't offer a way to pick a subdirectory as the
 deploy target (moving this here, out of a `dashboard-app/` subfolder, is
-what fixed that).
+what fixed the first deploy attempt).
 
 The standalone Node CLI version of this (same idea, run from a terminal or
 CI instead of embedded in the CMS) lives in [`cli/`](cli/README.md).
 
-## Why this isn't just the Node script running as-is
+## Why this is chunked instead of one continuous run
 
-Contentstack Launch's two function types each rule out the obvious designs:
+The first version of this used a Launch **Edge Function** streaming a
+single long-lived connection, since Edge Functions have no duration limit.
+That failed to deploy with:
 
-- **Cloud Functions** are real Node.js, but capped at a **30-second**
-  execution timeout — nowhere near enough for a full-stack publish run.
-- **Edge Functions** have **no duration limit** as long as the client holds
-  the connection open, but run a WinterCG runtime with **no Node.js APIs**
-  — `@contentstack/management`'s axios transport won't work there.
+> Only alphanumeric characters, hyphens, underscores and `[param]` should be
+> used in the naming of function and its parent directory.
 
-So this app runs the whole job inside one Edge Function
-(`functions/publish-stream.edge.js`), talking to the CMA via plain `fetch()`
-instead of the SDK, and streams progress back over that single connection as
-newline-delimited JSON while it runs — no job store, no polling, nothing to
-go stale between requests. The trade-off: if the dashboard tab closes
-mid-run, the stream ends (already-published items are harmless no-ops if you
-just re-run it).
+Turns out `[proxy].edge.js` (the pattern shown in Launch's own docs) isn't a
+general "give your edge function any name" convention — it's a single
+reserved filename for request-rewriting middleware. There's no way to stand
+up an arbitrary custom Edge Function endpoint on Launch, so the "one
+streaming connection for the whole run" design doesn't work at all, not
+just its filename.
 
-The request/response shapes used in `functions/lib/cma.js` and
-`functions/lib/pipeline.js` (publish body = `{ "entry": { locales,
-environments }, "locale": "..." }`, list responses keyed as
-`content_types`/`entries`/`assets`/`locales`) were confirmed directly against
-`@contentstack/management`'s bundled source, not just docs — see
-`cli/node_modules/@contentstack/management/dist/node/contentstack-management.js`
-(after `cd cli && npm install`) if you ever need to re-verify after an SDK
-upgrade.
+**Cloud Functions** are the real option: proper Node.js (so this uses the
+same `@contentstack/management` SDK as the CLI, not a raw-fetch
+reimplementation), normal alphanumeric filenames — but capped at a **30s**
+execution timeout. So the job is a resumable state machine
+(`functions/lib/pipelineStep.js`): each call to `functions/publish-step.js`
+does ~20s of work (discovering locales/content types/entries/assets, or
+publishing a batch of them) and returns a `state` blob describing exactly
+where it left off. The widget ([`public/index.html`](public/index.html))
+holds that `state` in a JS variable and POSTs it right back, looping until
+the response says `done`. No server-side job storage needed — the trade-off
+is the same one job+polling would have had: if the dashboard tab closes
+mid-run, the loop stops (already-published items are harmless no-ops if you
+just click the button again — the request-level idempotency of Contentstack
+publish is what makes "just resume from an empty state" acceptable here,
+rather than needing to persist and resume the exact cursor).
 
 ## Structure
 
 ```
-package.json          # no dependencies — just a no-op "build" script so
-                       # Launch's build step doesn't fail if it insists on
-                       # running one
+package.json          # declares @contentstack/management as a dependency;
+                       # "build": "true" as a no-op in case Launch insists
+                       # on running a build script regardless
 functions/
-  publish-stream.edge.js   # the one HTTP endpoint, GET /publish-stream
+  publish-step.js         # the one HTTP endpoint, POST /publish-step
   lib/
-    config.js              # reads Launch env vars
+    config.js             # reads Launch env vars (process.env)
+    stackClient.js         # @contentstack/management client, same as the CLI
     rateLimiter.js         # same throttle/retry logic as the CLI version
-    cma.js                 # raw-fetch CMA client
-    pipeline.js            # the actual publish logic, as an async generator
+    pipelineStep.js         # the resumable state machine
 public/
-  index.html               # the widget UI (button, progress bars, log)
+  index.html               # the widget UI (button, progress bars, log,
+                            # the client-side step loop)
 cli/                        # standalone Node CLI (see cli/README.md)
 ```
 
@@ -61,15 +67,15 @@ Same as the CLI: a stack Management Token, stored as a Launch environment
 variable, never sent to the browser. This means the app is wired to **one
 specific stack** — it's an internal tool, not a multi-tenant marketplace
 app. As a safety net, the widget passes the current stack's `api_key` (read
-from the App SDK) on every request, and the edge function refuses to run if
-it doesn't match the configured token's stack.
+from the App SDK) on every request, and the function refuses to run if it
+doesn't match the configured token's stack.
 
 ## Deploying
 
 1. **Launch project**: create a new Launch project pointing at this repo.
    - Framework Preset: **Other**
-   - Build Command: leave blank (there's a no-op `build` script in
-     `package.json` as a fallback in case Launch runs one regardless)
+   - Build Command: leave blank, or `npm run build` (there's a no-op
+     `build` script in `package.json` either way)
    - Output Directory: `./public`
    - Environment variables (Launch → your environment → Settings):
      `CS_STACK_API_KEY`, `CS_MANAGEMENT_TOKEN`, `CS_ENVIRONMENT`

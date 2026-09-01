@@ -1,8 +1,11 @@
 {
   "name": "publish-everything-dashboard-app",
   "private": true,
-  "description": "Dashboard Location app (Launch Edge Function + static widget) — see README.md",
+  "description": "Dashboard Location app (Launch Cloud Function + static widget) — see README.md",
   "scripts": {
     "build": "true"
+  },
+  "dependencies": {
+    "@contentstack/management": "^1.0.0"
   }
 }

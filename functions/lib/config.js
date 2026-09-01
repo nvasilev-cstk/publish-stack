@@ -8,9 +8,10 @@ const REGION_HOSTS = {
   GCP_EU: 'gcp-eu-api.contentstack.com',
 };
 
-// Edge Functions read config from context.env (WinterCG runtime, no process.env
-// / dotenv) — set these as Launch environment variables on the project.
-export function loadConfig(env) {
+// Cloud Functions are real Node.js and read config via process.env (unlike
+// Edge Functions, which use context.env) — set these as Launch environment
+// variables on the project.
+export function loadConfig(env = process.env) {
   const region = (env.CS_REGION || 'NA').toUpperCase();
   const host = env.CS_HOST || REGION_HOSTS[region];
   if (!host) {

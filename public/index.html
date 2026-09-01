@@ -63,6 +63,7 @@
     <button id="runButton" disabled>Publish All</button>
   </div>
 
+  <div class="stack-line" id="phaseLine"></div>
   <div class="progress">
     Entries: <span id="entriesCount">—</span>
     <div class="bar" id="entriesBar"><div></div></div>
@@ -81,12 +82,23 @@
   var runButton = document.getElementById('runButton');
   var dryRunCheckbox = document.getElementById('dryRun');
   var stackLine = document.getElementById('stackLine');
+  var phaseLine = document.getElementById('phaseLine');
   var logEl = document.getElementById('log');
   var summaryEl = document.getElementById('summary');
   var entriesCount = document.getElementById('entriesCount');
   var assetsCount = document.getElementById('assetsCount');
   var entriesBar = document.getElementById('entriesBar').firstElementChild;
   var assetsBar = document.getElementById('assetsBar').firstElementChild;
+
+  var PHASE_LABELS = {
+    'locales': 'Fetching locales...',
+    'content-types': 'Fetching content types...',
+    'entries': 'Fetching entries...',
+    'assets': 'Fetching assets...',
+    'publish-entries': 'Publishing entries...',
+    'publish-assets': 'Publishing assets...',
+    'done': 'Done.',
+  };
 
   function log(message, level) {
     var line = document.createElement('div');
@@ -104,84 +116,60 @@
     barEl.style.width = (total ? Math.round((done / total) * 100) : 0) + '%';
   }
 
-  function handleEvent(event) {
-    switch (event.type) {
-      case 'log':
-        log(event.message, event.level);
-        break;
-      case 'summary':
-        entriesCount.textContent = '0 / ' + event.entries;
-        assetsCount.textContent = '0 / ' + event.assets;
-        summaryEl.textContent =
-          'About to publish ' + event.entries + ' entries and ' + event.assets +
-          ' assets to "' + event.environment + '" across ' + event.locales + ' locale(s).';
-        break;
-      case 'progress':
-        setProgress(event.kind, event.done, event.total, event.failed);
-        break;
-      case 'done':
-        if (event.dryRun) {
-          summaryEl.textContent += ' Dry run — nothing was published.';
-        } else {
-          summaryEl.textContent =
-            'Done. Entries: ' + event.entriesPublished + ' published, ' + event.entriesFailed + ' failed. ' +
-            'Assets: ' + event.assetsPublished + ' published, ' + event.assetsFailed + ' failed.';
-        }
-        runButton.disabled = false;
-        break;
-      case 'fatal':
-        log('Fatal error: ' + event.message, 'error');
-        runButton.disabled = false;
-        break;
-    }
-  }
-
+  // The widget drives the whole job: it holds `state` between calls and
+  // POSTs it right back, since Cloud Functions can't keep it themselves
+  // (30s timeout per call — see ../README.md). Each call does ~20s of work.
   async function runPublish() {
     runButton.disabled = true;
     logEl.innerHTML = '';
     summaryEl.textContent = '';
+    phaseLine.textContent = '';
     setProgress('entries', 0, 0, 0);
     setProgress('assets', 0, 0, 0);
 
     var dryRun = dryRunCheckbox.checked;
-    var params = new URLSearchParams({ dryRun: String(dryRun) });
-    if (stackApiKey) params.set('stackApiKey', stackApiKey);
-
-    var response;
-    try {
-      response = await fetch('/publish-stream?' + params.toString());
-    } catch (err) {
-      log('Failed to reach the publish backend: ' + err.message, 'error');
-      runButton.disabled = false;
-      return;
-    }
-
-    if (!response.ok) {
-      var body = await response.json().catch(function () { return {}; });
-      log(body.error || ('Request failed with status ' + response.status), 'error');
-      runButton.disabled = false;
-      return;
-    }
-
-    var reader = response.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = '';
+    var state = undefined;
 
     for (;;) {
-      var chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      var lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (var i = 0; i < lines.length; i++) {
-        if (!lines[i]) continue;
-        try {
-          handleEvent(JSON.parse(lines[i]));
-        } catch (err) {
-          log('Could not parse progress event: ' + lines[i], 'error');
-        }
+      var response;
+      try {
+        response = await fetch('/publish-step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state: state, dryRun: dryRun, stackApiKey: stackApiKey }),
+        });
+      } catch (err) {
+        log('Failed to reach the publish backend: ' + err.message, 'error');
+        break;
       }
+
+      var data = await response.json().catch(function () { return {}; });
+
+      if (!response.ok) {
+        log(data.error || ('Request failed with status ' + response.status), 'error');
+        break;
+      }
+
+      (data.log || []).forEach(function (message) { log(message); });
+      if (data.progress) {
+        phaseLine.textContent = PHASE_LABELS[data.progress.phase] || data.progress.phase;
+        setProgress('entries', data.progress.entries.done, data.progress.entries.total, data.progress.entries.failed);
+        setProgress('assets', data.progress.assets.done, data.progress.assets.total, data.progress.assets.failed);
+      }
+
+      if (data.done) {
+        var s = data.summary || {};
+        summaryEl.textContent = s.dryRun
+          ? 'Dry run — would publish ' + s.entries + ' entries and ' + s.assets + ' assets. Nothing was published.'
+          : 'Done. Entries: ' + s.entriesPublished + ' published, ' + s.entriesFailed + ' failed. ' +
+            'Assets: ' + s.assetsPublished + ' published, ' + s.assetsFailed + ' failed.';
+        break;
+      }
+
+      state = data.state;
     }
+
+    runButton.disabled = false;
   }
 
   runButton.addEventListener('click', runPublish);
